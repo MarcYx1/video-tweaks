@@ -1,0 +1,298 @@
+#!/usr/bin/python3
+"""Video Tweaks: compress a video to a target size and/or mix its audio tracks into one."""
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+DCOMP = Path(__file__).resolve().parent / "dcomp"
+TIME_RE = re.compile(r"time=(\d+):(\d+):([\d.]+)")
+
+
+# ---------- engine (no GTK) ----------
+
+def probe(path):
+    """Return (duration in s, list of audio track titles)."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=codec_type:stream_tags=title", "-of", "json", path],
+        capture_output=True, text=True, check=True).stdout
+    d = json.loads(out)
+    titles = [s.get("tags", {}).get("title", "") for s in d["streams"] if s["codec_type"] == "audio"]
+    return float(d["format"].get("duration") or 0), titles
+
+
+def mix_cmd(src, tracks, dst):
+    if len(tracks) == 1:
+        audio = ["-map", f"0:a:{tracks[0]}", "-c:a", "copy"]
+    else:
+        graph = "".join(f"[0:a:{i}]" for i in tracks) + f"amix=inputs={len(tracks)}:normalize=0[a]"
+        audio = ["-filter_complex", graph, "-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+    return ["ffmpeg", "-hide_banner", "-y", "-i", src, "-map", "0:v:0?", *audio,
+            "-c:v", "copy", "-movflags", "+faststart", dst]
+
+
+def plan(src, track_count, tracks, only_mix, mb, out_dir, tmp):
+    """Return (output path, steps). A step is (weight, argv, is_dcomp)."""
+    stem = Path(src).stem
+    out = str(Path(out_dir) / (f"{stem}_mixed.mp4" if only_mix else f"{stem}_{mb}mb.mp4"))
+    if only_mix:
+        return out, [(1.0, mix_cmd(src, tracks, out), False)]
+    if track_count > 1:  # dcomp keeps only one audio track, so mix the chosen ones first
+        mixed = os.path.join(tmp, "mixed.mp4")
+        return out, [(0.1, mix_cmd(src, tracks, mixed), False),
+                     (0.9, [str(DCOMP), mixed, str(mb), out], True)]
+    return out, [(1.0, [str(DCOMP), src, str(mb), out], True)]
+
+
+class Job:
+    """Runs the steps one after another. Callbacks are called from the worker thread."""
+
+    def __init__(self, steps, duration, env, on_line, on_progress):
+        self.steps, self.duration, self.env = steps, duration, env
+        self.on_line, self.on_progress = on_line, on_progress
+        self.proc, self.cancelled = None, False
+
+    def run(self):
+        done = 0.0
+        for weight, argv, is_dcomp in self.steps:
+            if self.cancelled:
+                return -signal.SIGKILL
+            self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         start_new_session=True, env=self.env)
+            ffpass, buf = 1, b""
+            while chunk := os.read(self.proc.stdout.fileno(), 4096):
+                *lines, buf = re.split(rb"[\r\n]", buf + chunk)
+                for raw in lines:
+                    line = raw.decode(errors="replace")
+                    if not line.strip():
+                        continue
+                    self.on_line(line)
+                    if line.startswith("Output #0, null"):
+                        ffpass = 1
+                    elif line.startswith("Output #0, mp4"):
+                        ffpass = 2
+                    m = TIME_RE.search(line)
+                    if m and self.duration > 0:
+                        t = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+                        part = min(t / self.duration, 1.0)
+                        if is_dcomp:
+                            part = (ffpass - 1 + part) / 2
+                        self.on_progress(min(done + weight * part, 0.99))
+            if buf.strip():
+                self.on_line(buf.decode(errors="replace"))
+            rc = self.proc.wait()
+            if rc or self.cancelled:
+                return rc or -signal.SIGKILL
+            done += weight
+        self.on_progress(1.0)
+        return 0
+
+    def cancel(self):
+        self.cancelled = True
+        if self.proc and self.proc.poll() is None:
+            # KILL, not TERM: on TERM ffmpeg finalizes and rewrites the output file
+            os.killpg(self.proc.pid, signal.SIGKILL)
+
+
+# ---------- UI ----------
+
+def track_name(title, i):
+    title = title.removeprefix("Devices: ").replace("Monitor of ", "")
+    return title or f"Track {i + 1}"
+
+
+def human_size(path):
+    n = os.path.getsize(path)
+    return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{n / 1e3:.0f} kB"
+
+
+def main():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, GLib, Gtk
+
+    class Window(Adw.ApplicationWindow):
+        def __init__(self, app, path):
+            super().__init__(application=app, default_width=560, default_height=680)
+            self.path, self.job = path, None
+            self.duration, titles = probe(path)
+            self.out_dir = str(Path(path).parent)
+            self.set_title("Video Tweaks")
+
+            self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+            view = Adw.ToolbarView(content=self.stack)
+            view.add_top_bar(Adw.HeaderBar(title_widget=Adw.WindowTitle(
+                title="Video Tweaks", subtitle=Path(path).name)))
+            self.set_content(view)
+
+            # settings page
+            page = Adw.PreferencesPage()
+            group = Adw.PreferencesGroup()
+            page.add(group)
+            self.only_mix = Adw.SwitchRow(title="Only mix audio", subtitle="Keep the original video quality")
+            self.only_mix.connect("notify::active", self.update)
+            if len(titles) > 1:
+                group.add(self.only_mix)
+            self.size = Adw.SpinRow.new_with_range(1, 500, 1)
+            self.size.set_title("Target size")
+            self.size.set_subtitle("MB")
+            self.size.set_value(8)
+            group.add(self.size)
+            self.folder_row = Adw.ActionRow(title="Output folder", subtitle=self.out_dir)
+            pick = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER,
+                              tooltip_text="Choose folder", css_classes=["flat"])
+            pick.connect("clicked", self.pick_folder)
+            self.folder_row.add_suffix(pick)
+            self.folder_row.set_activatable_widget(pick)
+            group.add(self.folder_row)
+
+            self.checks = []
+            if len(titles) > 1:
+                tg = Adw.PreferencesGroup(title="Audio tracks",
+                                          description="Checked tracks are mixed into one")
+                page.add(tg)
+                for i, t in enumerate(titles):
+                    row = Adw.ActionRow(title=track_name(t, i), subtitle=f"Track {i + 1}")
+                    cb = Gtk.CheckButton(active=True, valign=Gtk.Align.CENTER)
+                    cb.connect("toggled", self.update)
+                    row.add_prefix(cb)
+                    row.set_activatable_widget(cb)
+                    tg.add(row)
+                    self.checks.append(cb)
+            self.track_count = len(titles)
+
+            self.go = Gtk.Button(halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
+            self.go.connect("clicked", self.start)
+            settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            settings.append(page)
+            page.set_vexpand(True)
+            settings.append(self.wrap(self.go))
+            self.stack.add_named(settings, "settings")
+
+            # progress page
+            self.status = Gtk.Label(css_classes=["title-4"], wrap=True, xalign=0)
+            self.bar = Gtk.ProgressBar(show_text=True)
+            self.log = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                    top_margin=8, bottom_margin=8, left_margin=10, right_margin=10)
+            self.log_end = self.log.get_buffer().create_mark(None, self.log.get_buffer().get_end_iter(), False)
+            scroll = Gtk.ScrolledWindow(child=self.log, vexpand=True, css_classes=["card"])
+            self.cancel_btn = Gtk.Button(label="Cancel", css_classes=["pill"])
+            self.cancel_btn.connect("clicked", lambda *_: self.job and self.job.cancel())
+            self.show_btn = Gtk.Button(label="Show in Files", css_classes=["pill", "suggested-action"])
+            self.show_btn.connect("clicked", self.show_in_files)
+            self.back_btn = Gtk.Button(label="Back", css_classes=["pill"])
+            self.back_btn.connect("clicked", lambda *_: self.stack.set_visible_child_name("settings"))
+            buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+            for b in (self.cancel_btn, self.back_btn, self.show_btn):
+                buttons.append(b)
+            prog = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                           margin_top=18, margin_bottom=24, margin_start=18, margin_end=18)
+            for w in (self.status, self.bar, scroll, buttons):
+                prog.append(w)
+            self.stack.add_named(prog, "progress")
+
+            self.connect("close-request", self.on_close)
+            self.update()
+
+        def on_close(self, *_):
+            if self.job:
+                self.job.cancel()
+            return False
+
+        def wrap(self, button):
+            box = Gtk.Box(halign=Gtk.Align.CENTER, margin_top=12, margin_bottom=24)
+            box.append(button)
+            return box
+
+        def selected(self):
+            return [i for i, cb in enumerate(self.checks) if cb.get_active()] or [0]
+
+        def update(self, *_):
+            mix = self.only_mix.get_active()
+            self.size.set_sensitive(not mix)
+            self.go.set_label("Mix Audio" if mix else "Compress")
+            self.go.set_sensitive(not self.checks or any(cb.get_active() for cb in self.checks))
+
+        def pick_folder(self, *_):
+            dialog = Gtk.FileDialog(title="Output folder", initial_folder=Gio.File.new_for_path(self.out_dir))
+
+            def done(d, res):
+                try:
+                    self.out_dir = d.select_folder_finish(res).get_path()
+                    self.folder_row.set_subtitle(self.out_dir)
+                except GLib.Error:
+                    pass  # dialog dismissed
+            dialog.select_folder(self, None, done)
+
+        def start(self, *_):
+            mb = int(self.size.get_value())
+            self.tmp = tempfile.mkdtemp(prefix="video-tweaks.")
+            self.out, steps = plan(self.path, self.track_count, self.selected(),
+                                   self.only_mix.get_active(), mb, self.out_dir, self.tmp)
+            self.log.get_buffer().set_text("")
+            self.bar.set_fraction(0)
+            self.status.set_label(f"Mixing audio of {Path(self.path).name}…" if self.only_mix.get_active()
+                                  else f"Compressing {Path(self.path).name} to {mb} MB…")
+            self.cancel_btn.set_visible(True)
+            self.back_btn.set_visible(False)
+            self.show_btn.set_visible(False)
+            self.stack.set_visible_child_name("progress")
+            env = dict(os.environ, TMPDIR=self.tmp)
+            self.job = Job(steps, self.duration, env,
+                           lambda l: GLib.idle_add(self.add_line, l),
+                           lambda f: GLib.idle_add(self.bar.set_fraction, f))
+            threading.Thread(target=self.work, daemon=True).start()
+
+        def work(self):
+            rc = self.job.run()
+            GLib.idle_add(self.finished, rc, self.job.cancelled)
+
+        def add_line(self, line):
+            buf = self.log.get_buffer()
+            buf.insert(buf.get_end_iter(), line + "\n")
+            self.log.scroll_mark_onscreen(self.log_end)
+
+        def finished(self, rc, cancelled):
+            self.job = None
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            self.cancel_btn.set_visible(False)
+            self.back_btn.set_visible(True)
+            if rc == 0:
+                self.bar.set_fraction(1)
+                self.status.set_label(f"Done: {Path(self.out).name} ({human_size(self.out)})")
+                self.show_btn.set_visible(True)
+                return
+            Path(self.out).unlink(missing_ok=True)
+            if cancelled:
+                self.stack.set_visible_child_name("settings")
+            else:
+                self.status.set_label(f"Failed (exit code {rc}). See the output below.")
+
+        def show_in_files(self, *_):
+            Gtk.FileLauncher(file=Gio.File.new_for_path(self.out)).open_containing_folder(self, None, None)
+
+    class App(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.MarcYx1.VideoTweaks",
+                             flags=Gio.ApplicationFlags.HANDLES_OPEN)
+
+        def do_open(self, files, n, hint):
+            for f in files:
+                Window(self, f.get_path()).present()
+
+        def do_activate(self):
+            print("usage: video-tweaks <video>...", file=sys.stderr)
+
+    sys.exit(App().run(sys.argv))
+
+
+if __name__ == "__main__":
+    main()

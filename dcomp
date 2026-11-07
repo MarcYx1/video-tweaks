@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# dcomp <input> [target_MB=8] [output]
+set -euo pipefail
+[ $# -lt 1 ] && { echo "usage: dcomp <input> [MB] [output]"; exit 1; }
+
+in="$1"
+mb="${2:-8}"
+out="${3:-${in%.*}_discord.mp4}"
+abr=96   # audio kbps
+
+dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$in")
+# 5% safety margin for container overhead
+vbr=$(awk -v mb="$mb" -v d="$dur" -v a="$abr" \
+  'BEGIN{v=int(mb*8000*0.95/d - a); print (v<100?100:v)}')
+
+# Lower the resolution when the bitrate is low, otherwise it turns to mush
+if   [ "$vbr" -lt 600 ];  then vf="scale=-2:'min(480,ih)'"
+elif [ "$vbr" -lt 1500 ]; then vf="scale=-2:'min(720,ih)'"
+else                           vf="scale=-2:'min(1080,ih)'"; fi
+
+log=$(mktemp -u "${TMPDIR:-/tmp}/dcomp.XXXX")
+echo "duration ${dur}s -> video ${vbr}k, audio ${abr}k"
+
+ffmpeg -hide_banner -y -i "$in" -vf "$vf" -c:v libx264 -preset slow -b:v ${vbr}k \
+  -pass 1 -passlogfile "$log" -an -f null /dev/null
+ffmpeg -hide_banner -y -i "$in" -vf "$vf" -c:v libx264 -preset slow -b:v ${vbr}k \
+  -pass 2 -passlogfile "$log" -c:a aac -b:a ${abr}k -movflags +faststart "$out"
+
+rm -f "$log"*
+ls -lh "$out"

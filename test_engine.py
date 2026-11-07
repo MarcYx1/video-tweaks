@@ -1,0 +1,78 @@
+#!/usr/bin/python3
+"""Engine self-check, no GUI: python3 test_engine.py"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+loader = importlib.machinery.SourceFileLoader("vt", str(here / "video-tweaks"))
+spec = importlib.util.spec_from_loader("vt", loader)
+vt = importlib.util.module_from_spec(spec)
+loader.exec_module(vt)
+
+
+def ff(*a):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", *a], check=True)
+
+
+def streams(p):
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", p],
+                         capture_output=True, text=True, check=True).stdout
+    return [s["codec_type"] for s in json.loads(out)["streams"]]
+
+
+def run(steps, dur, tmp):
+    prog = []
+    job = vt.Job(steps, dur, dict(os.environ, TMPDIR=tmp), lambda l: None, prog.append)
+    return job.run(), prog
+
+
+with tempfile.TemporaryDirectory() as d:
+    src = os.path.join(d, "clip one.mp4")
+    ff("-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30", *[x for f in (220, 330, 440, 550)
+       for x in ("-f", "lavfi", "-i", f"sine=f={f}")], "-t", "10",
+       "-map", "0", "-map", "1", "-map", "2", "-map", "3", "-map", "4",
+       "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", src)
+    dur, titles = vt.probe(src)
+    assert abs(dur - 10) < 0.5 and len(titles) == 4, (dur, titles)
+
+    # only mix: video copied, one audio track
+    out, steps = vt.plan(src, 4, [0, 2], True, 8, d, d)
+    assert out.endswith("clip one_mixed.mp4")
+    rc, prog = run(steps, dur, d)
+    assert rc == 0 and streams(out) == ["video", "audio"], streams(out)
+    assert prog[-1] == 1.0
+
+    # compress + mix: under target size, one audio track, bar rises
+    tmp = tempfile.mkdtemp(dir=d)
+    out, steps = vt.plan(src, 4, [0, 1, 2, 3], False, 1, d, tmp)
+    assert out.endswith("clip one_1mb.mp4") and len(steps) == 2
+    rc, prog = run(steps, dur, tmp)
+    assert rc == 0 and streams(out) == ["video", "audio"]
+    # x264 overshoots ~5-10 % on a 10 s synthetic clip; a real 60 s clip at 8 MB came out 7.3 MB
+    assert os.path.getsize(out) <= 1_100_000, os.path.getsize(out)
+    assert prog == sorted(prog) and len(prog) > 5 and prog[-1] == 1.0, prog
+
+    # cancel mid-encode: no ffmpeg left, pass logs only in the job's TMPDIR
+    tmp = tempfile.mkdtemp(dir=d)
+    out, steps = vt.plan(src, 4, [0, 1], False, 2, d, tmp)
+    os.unlink(os.path.join(d, "clip one_1mb.mp4"))
+    job = vt.Job(steps, dur, dict(os.environ, TMPDIR=tmp), lambda l: None, lambda f: None)
+    t = threading.Thread(target=job.run)
+    t.start()
+    time.sleep(1.5)
+    pid = job.proc.pid
+    job.cancel()
+    t.join(10)
+    assert not t.is_alive() and job.cancelled
+    time.sleep(0.5)
+    left = subprocess.run(["ps", "-eo", "pgid="], capture_output=True, text=True).stdout.split()
+    assert str(pid) not in left, "process group still alive"
+
+print("engine ok")
