@@ -12,6 +12,9 @@ import threading
 from pathlib import Path
 
 DCOMP = Path(__file__).resolve().parent / "dcomp"
+# RNNoise speech model: next to the script in the repo, or where install.sh puts it
+MODEL = next((p for p in (Path(__file__).resolve().parent / "models" / "sh.rnnn",
+                          Path.home() / ".local/share/video-tweaks/sh.rnnn") if p.exists()), None)
 TIME_RE = re.compile(r"time=(\d+):(\d+):([\d.]+)")
 
 
@@ -28,25 +31,29 @@ def probe(path):
     return float(d["format"].get("duration") or 0), titles
 
 
-def mix_cmd(src, tracks, dst):
-    if len(tracks) == 1:
+def mix_cmd(src, tracks, dst, denoise=None):
+    """Mix the chosen audio tracks into one; track `denoise` (if any) goes through RNNoise first."""
+    if len(tracks) == 1 and denoise is None:
         audio = ["-map", f"0:a:{tracks[0]}", "-c:a", "copy"]
     else:
-        graph = "".join(f"[0:a:{i}]" for i in tracks) + f"amix=inputs={len(tracks)}:normalize=0[a]"
+        # ponytail: model path is single-quoted, breaks if it contains a ' (install path never does)
+        pre = "".join(f"[0:a:{i}]highpass=f=80,arnndn=m='{MODEL}'[d{i}];" for i in tracks if i == denoise)
+        ins = "".join(f"[d{i}]" if i == denoise else f"[0:a:{i}]" for i in tracks)
+        graph = pre + ins + f"amix=inputs={len(tracks)}:normalize=0[a]"
         audio = ["-filter_complex", graph, "-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
     return ["ffmpeg", "-hide_banner", "-y", "-i", src, "-map", "0:v:0?", *audio,
             "-c:v", "copy", "-movflags", "+faststart", dst]
 
 
-def plan(src, track_count, tracks, only_mix, mb, out_dir, tmp):
+def plan(src, track_count, tracks, only_mix, mb, out_dir, tmp, denoise=None):
     """Return (output path, steps). A step is (weight, argv, is_dcomp)."""
     stem = Path(src).stem
     out = str(Path(out_dir) / (f"{stem}_mixed.mp4" if only_mix else f"{stem}_{mb}mb.mp4"))
     if only_mix:
-        return out, [(1.0, mix_cmd(src, tracks, out), False)]
-    if track_count > 1:  # dcomp keeps only one audio track, so mix the chosen ones first
+        return out, [(1.0, mix_cmd(src, tracks, out, denoise), False)]
+    if track_count > 1 or denoise is not None:  # dcomp keeps one audio track as is: mix/filter first
         mixed = os.path.join(tmp, "mixed.mp4")
-        return out, [(0.1, mix_cmd(src, tracks, mixed), False),
+        return out, [(0.1, mix_cmd(src, tracks, mixed, denoise), False),
                      (0.9, [str(DCOMP), mixed, str(mb), out], True)]
     return out, [(1.0, [str(DCOMP), src, str(mb), out], True)]
 
@@ -121,7 +128,7 @@ def main():
 
     class Window(Adw.ApplicationWindow):
         def __init__(self, app, path):
-            super().__init__(application=app, default_width=560, default_height=680)
+            super().__init__(application=app, default_width=560, default_height=760)
             self.path, self.job = path, None
             self.duration, titles = probe(path)
             self.out_dir = str(Path(path).parent)
@@ -155,10 +162,14 @@ def main():
             group.add(self.folder_row)
 
             self.checks = []
-            if len(titles) > 1:
-                tg = Adw.PreferencesGroup(title="Audio tracks",
-                                          description="Checked tracks are mixed into one")
+            self.noise = Adw.ComboRow(title="Filter mic noise", subtitle="Removes breathing and background noise",
+                                      model=Gtk.StringList.new(["Off", *(track_name(t, i) for i, t in enumerate(titles))]))
+            if titles:
+                tg = Adw.PreferencesGroup(title="Audio")
                 page.add(tg)
+            if len(titles) > 1:
+                tg.set_title("Audio tracks")
+                tg.set_description("Checked tracks are mixed into one")
                 for i, t in enumerate(titles):
                     row = Adw.ActionRow(title=track_name(t, i), subtitle=f"Track {i + 1}")
                     cb = Gtk.CheckButton(active=True, valign=Gtk.Align.CENTER)
@@ -167,6 +178,8 @@ def main():
                     row.set_activatable_widget(cb)
                     tg.add(row)
                     self.checks.append(cb)
+            if titles and MODEL:
+                tg.add(self.noise)
             self.track_count = len(titles)
 
             self.go = Gtk.Button(halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
@@ -235,8 +248,10 @@ def main():
         def start(self, *_):
             mb = int(self.size.get_value())
             self.tmp = tempfile.mkdtemp(prefix="video-tweaks.")
+            pick = self.noise.get_selected()
             self.out, steps = plan(self.path, self.track_count, self.selected(),
-                                   self.only_mix.get_active(), mb, self.out_dir, self.tmp)
+                                   self.only_mix.get_active(), mb, self.out_dir, self.tmp,
+                                   pick - 1 if pick > 0 else None)
             self.log.get_buffer().set_text("")
             self.bar.set_fraction(0)
             self.status.set_label(f"Mixing audio of {Path(self.path).name}…" if self.only_mix.get_active()

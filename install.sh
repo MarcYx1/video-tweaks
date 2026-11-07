@@ -4,9 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 BIN="$HOME/.local/bin"
 EXT="$HOME/.local/share/nautilus-python/extensions"
+DATA="$HOME/.local/share/video-tweaks"
 
 if [ "${1:-}" = "--uninstall" ]; then
-  rm -f "$BIN/video-tweaks" "$BIN/dcomp" "$EXT/video_tweaks.py"
+  rm -f "$BIN/video-tweaks" "$BIN/dcomp" "$EXT/video_tweaks.py" "$DATA/sh.rnnn"
+  rmdir "$DATA" 2>/dev/null || true
   echo "Removed. Restart Files with: nautilus -q"
   exit 0
 fi
@@ -25,4 +27,5 @@ compgen -G "/usr/lib*/nautilus/extensions-4/libnautilus-python.so" >/dev/null \
 
 install -Dm755 -t "$BIN" video-tweaks dcomp
 install -Dm644 -t "$EXT" nautilus/video_tweaks.py
+install -Dm644 -t "$DATA" models/sh.rnnn
 echo "Installed. Restart Files with: nautilus -q"

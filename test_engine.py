@@ -49,6 +49,19 @@ with tempfile.TemporaryDirectory() as d:
     assert rc == 0 and streams(out) == ["video", "audio"], streams(out)
     assert prog[-1] == 1.0
 
+    # noise filter: on one track of a mix, and on a single track alone (no plain copy then)
+    assert vt.MODEL, "models/sh.rnnn missing"
+    out, steps = vt.plan(src, 4, [0, 3], True, 8, d, d, denoise=3)
+    assert "arnndn" in " ".join(steps[0][1])
+    rc, _ = run(steps, dur, d)
+    assert rc == 0 and streams(out) == ["video", "audio"]
+    out, steps = vt.plan(src, 4, [3], True, 8, d, d, denoise=3)
+    assert "copy" not in steps[0][1][steps[0][1].index("-c:a") + 1]
+    rc, _ = run(steps, dur, d)
+    assert rc == 0 and streams(out) == ["video", "audio"]
+    _, steps = vt.plan(src, 1, [0], False, 8, d, d, denoise=0)
+    assert len(steps) == 2, "single-track compress with filter needs the mix step"
+
     # compress + mix: under target size, one audio track, bar rises
     tmp = tempfile.mkdtemp(dir=d)
     out, steps = vt.plan(src, 4, [0, 1, 2, 3], False, 1, d, tmp)
