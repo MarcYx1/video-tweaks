@@ -67,3 +67,7 @@ python3 test_engine.py
 ```
 
 Runs the mix, compress and cancel paths on a generated 4-track clip, no window needed.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
