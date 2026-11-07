@@ -37,7 +37,11 @@ def mix_cmd(src, tracks, dst, denoise=None):
         audio = ["-map", f"0:a:{tracks[0]}", "-c:a", "copy"]
     else:
         # ponytail: model path is single-quoted, breaks if it contains a ' (install path never does)
-        pre = "".join(f"[0:a:{i}]highpass=f=80,arnndn=m='{MODEL}'[d{i}];" for i in tracks if i == denoise)
+        # aeval: arnndn leaves garbage (NaN or huge values) in the last partial frame at end of stream,
+        # which makes aac fail; zero anything that is NaN or beyond +-2 (real audio stays within +-1)
+        pre = "".join(f"[0:a:{i}]highpass=f=80,arnndn=m='{MODEL}',"
+                      f"aeval=exprs='if(isnan(val(ch))+gt(abs(val(ch)),2),0,val(ch))':c=same[d{i}];"
+                      for i in tracks if i == denoise)
         ins = "".join(f"[d{i}]" if i == denoise else f"[0:a:{i}]" for i in tracks)
         graph = pre + ins + f"amix=inputs={len(tracks)}:normalize=0[a]"
         audio = ["-filter_complex", graph, "-map", "[a]", "-c:a", "aac", "-b:a", "192k"]

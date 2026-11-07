@@ -28,9 +28,12 @@ def streams(p):
 
 
 def run(steps, dur, tmp):
-    prog = []
-    job = vt.Job(steps, dur, dict(os.environ, TMPDIR=tmp), lambda l: None, prog.append)
-    return job.run(), prog
+    prog, lines = [], []
+    job = vt.Job(steps, dur, dict(os.environ, TMPDIR=tmp), lines.append, prog.append)
+    rc = job.run()
+    if rc:
+        print("\n".join(lines[-15:]))
+    return rc, prog
 
 
 with tempfile.TemporaryDirectory() as d:
@@ -59,6 +62,13 @@ with tempfile.TemporaryDirectory() as d:
     assert "copy" not in steps[0][1][steps[0][1].index("-c:a") + 1]
     rc, _ = run(steps, dur, d)
     assert rc == 0 and streams(out) == ["video", "audio"]
+    # length that ends in a partial 10 ms frame: arnndn used to emit NaNs there and aac failed
+    odd = os.path.join(d, "odd.mp4")
+    ff("-f", "lavfi", "-i", "testsrc=size=320x240:rate=30", "-f", "lavfi", "-i", "anoisesrc=a=0.1",
+       "-t", "3.0035", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", odd)
+    out, steps = vt.plan(odd, 1, [0], True, 8, d, d, denoise=0)
+    rc, _ = run(steps, 3.0, d)
+    assert rc == 0, "denoise on a partial last frame failed"
     _, steps = vt.plan(src, 1, [0], False, 8, d, d, denoise=0)
     assert len(steps) == 2, "single-track compress with filter needs the mix step"
 
