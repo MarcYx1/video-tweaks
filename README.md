@@ -2,18 +2,19 @@
 
 Right-click a video in GNOME Files and pick **Video Tweaks** to:
 
+- **Trim** it: the window plays the video and shows a timeline under it. Drag the start and end handles (the video shows the frame you are on), or play to a point and press **Set start** / **Set end**. Click elsewhere on the timeline to move the playhead.
 - **Compress** it to a target size (default 8 MB), for example to fit Discord's upload limit.
 - **Mix audio tracks** into one. Screen recorders such as GPU Screen Recorder or OBS can save game, chat, media and mic on separate tracks. Discord and most players only play the first track, so the rest is silent. Pick the tracks you want and they get mixed into one.
-- **Only mix audio**: mix the tracks and keep the original video untouched (no re-encode).
+- **Keep original quality**: trim and/or mix without re-encoding the video. The cut then starts at the keyframe before your start point; players that honour MP4 edit lists still start at the exact frame. Compressing always cuts frame-exact.
 - **Filter mic noise**: pick one track (your mic) and run it through [RNNoise](https://jmvalin.ca/demo/rnnoise/) to cut breathing, fans and keyboard noise while keeping your voice.
 
 ![Video Tweaks window](docs/screenshot.png)
 
-Output goes next to the original video by default: `clip_8mb.mp4` when compressing, `clip_mixed.mp4` when only mixing.
+Output goes next to the original video by default: `clip_8mb.mp4` when compressing, `clip_trimmed.mp4` or `clip_mixed.mp4` with **Keep original quality**.
 
 ## How it works
 
-- `dcomp` does the compression: a two-pass x264 encode with the bitrate worked out from the target size and the clip length. It lowers the resolution for long clips so they don't turn to mush (480p under 600 kbit/s, 720p under 1500 kbit/s, else up to 1080p). It also works on its own: `dcomp <video> [MB] [output]`.
+- `dcomp` does the compression: a two-pass x264 encode with the bitrate worked out from the target size and the clip length. It lowers the resolution for long clips so they don't turn to mush (480p under 600 kbit/s, 720p under 1500 kbit/s, else up to 1080p). It also works on its own: `dcomp <video> [MB] [output] [start_s] [end_s]`.
 - `video-tweaks` is the window (GTK 4 + libadwaita). It mixes the chosen tracks with ffmpeg first, then runs `dcomp`.
 - `nautilus/video_tweaks.py` adds the right-click item. It shows only when every selected file is a video.
 - `models/sh.rnnn` is the RNNoise speech model ("somnolent-hogwash") from [GregorR/rnnoise-models](https://github.com/GregorR/rnnoise-models), which states its models are not subject to copyright. The noise filter is ffmpeg's `highpass=f=80,arnndn` on the chosen track.
@@ -68,7 +69,7 @@ video-tweaks clip.mp4 [more clips...]
 python3 test_engine.py
 ```
 
-Runs the mix, compress and cancel paths on a generated 4-track clip, no window needed.
+Runs the mix, trim, compress and cancel paths on a generated 4-track clip, no window needed.
 
 ## License
 

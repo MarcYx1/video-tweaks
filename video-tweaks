@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Video Tweaks: compress a video to a target size and/or mix its audio tracks into one."""
+"""Video Tweaks: trim a video, compress it to a target size and/or mix its audio tracks into one."""
 import json
 import os
 import re
@@ -31,8 +31,9 @@ def probe(path):
     return float(d["format"].get("duration") or 0), titles
 
 
-def mix_cmd(src, tracks, dst, denoise=None):
-    """Mix the chosen audio tracks into one; track `denoise` (if any) goes through RNNoise first."""
+def mix_cmd(src, tracks, dst, denoise=None, trim=None):
+    """Mix the chosen audio tracks into one; track `denoise` (if any) goes through RNNoise first.
+    trim=(start, end) in s: video is copied, so the cut starts at the keyframe before `start`."""
     if len(tracks) == 1 and denoise is None:
         audio = ["-map", f"0:a:{tracks[0]}", "-c:a", "copy"]
     else:
@@ -45,21 +46,25 @@ def mix_cmd(src, tracks, dst, denoise=None):
         ins = "".join(f"[d{i}]" if i == denoise else f"[0:a:{i}]" for i in tracks)
         graph = pre + ins + f"amix=inputs={len(tracks)}:normalize=0[a]"
         audio = ["-filter_complex", graph, "-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
-    return ["ffmpeg", "-hide_banner", "-y", "-i", src, "-map", "0:v:0?", *audio,
+    cut = ["-ss", str(trim[0]), "-to", str(trim[1])] if trim else []
+    return ["ffmpeg", "-hide_banner", "-y", *cut, "-i", src, "-map", "0:v:0?", *audio,
             "-c:v", "copy", "-movflags", "+faststart", dst]
 
 
-def plan(src, track_count, tracks, only_mix, mb, out_dir, tmp, denoise=None):
-    """Return (output path, steps). A step is (weight, argv, is_dcomp)."""
+def plan(src, track_count, tracks, only_mix, mb, out_dir, tmp, denoise=None, trim=None):
+    """Return (output path, steps). A step is (weight, argv, is_dcomp). trim=(start, end) in s or None."""
     stem = Path(src).stem
-    out = str(Path(out_dir) / (f"{stem}_mixed.mp4" if only_mix else f"{stem}_{mb}mb.mp4"))
+    mixing = len(tracks) > 1 or denoise is not None
+    tag = ("trimmed" if trim and not mixing else "mixed") if only_mix else f"{mb}mb"
+    out = str(Path(out_dir) / f"{stem}_{tag}.mp4")
     if only_mix:
-        return out, [(1.0, mix_cmd(src, tracks, out, denoise), False)]
+        return out, [(1.0, mix_cmd(src, tracks, out, denoise, trim), False)]
+    cut = [str(trim[0]), str(trim[1])] if trim else []  # dcomp cuts exact, the mix step does not cut
     if track_count > 1 or denoise is not None:  # dcomp keeps one audio track as is: mix/filter first
         mixed = os.path.join(tmp, "mixed.mp4")
         return out, [(0.1, mix_cmd(src, tracks, mixed, denoise), False),
-                     (0.9, [str(DCOMP), mixed, str(mb), out], True)]
-    return out, [(1.0, [str(DCOMP), src, str(mb), out], True)]
+                     (0.9, [str(DCOMP), mixed, str(mb), out, *cut], True)]
+    return out, [(1.0, [str(DCOMP), src, str(mb), out, *cut], True)]
 
 
 class Job:
@@ -119,6 +124,11 @@ def track_name(title, i):
     return title or f"Track {i + 1}"
 
 
+def clock(t):
+    m, s = divmod(t, 60)
+    return f"{int(m):02d}:{s:04.1f}"
+
+
 def human_size(path):
     n = os.path.getsize(path)
     return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{n / 1e3:.0f} kB"
@@ -128,11 +138,11 @@ def main():
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Adw, Gio, GLib, Gtk
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
     class Window(Adw.ApplicationWindow):
         def __init__(self, app, path):
-            super().__init__(application=app, default_width=560, default_height=760)
+            super().__init__(application=app, default_width=560, default_height=900)
             self.path, self.job = path, None
             self.duration, titles = probe(path)
             self.out_dir = str(Path(path).parent)
@@ -146,12 +156,40 @@ def main():
 
             # settings page
             page = Adw.PreferencesPage()
+            # trim: video preview, timeline with start/end handles under it
+            self.start_t, self.end_t, self.drag = 0.0, self.duration, None
+            self.media = Gtk.MediaFile.new_for_filename(path)
+            self.timeline = Gtk.DrawingArea(content_height=36, margin_top=8)
+            self.timeline.set_draw_func(self.draw_timeline)
+            self.media.connect("notify::timestamp", lambda *_: self.timeline.queue_draw())
+            drag = Gtk.GestureDrag()
+            drag.connect("drag-begin", self.drag_begin)
+            drag.connect("drag-update", self.drag_update)
+            self.timeline.add_controller(drag)
+            set_start = Gtk.Button(label="Set start", tooltip_text="Start at the playhead", css_classes=["flat"])
+            set_start.connect("clicked", lambda *_: self.set_trim(start=self.playhead()))
+            set_end = Gtk.Button(label="Set end", tooltip_text="End at the playhead", css_classes=["flat"])
+            set_end.connect("clicked", lambda *_: self.set_trim(end=self.playhead()))
+            self.trim_label = Gtk.Label(hexpand=True, css_classes=["numeric", "dim-label"])
+            row = Gtk.Box(spacing=6, margin_top=4)
+            for w in (set_start, self.trim_label, set_end):
+                row.append(w)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            for w in (Gtk.Video(media_stream=self.media, height_request=260, css_classes=["card"]),
+                      self.timeline, row):
+                box.append(w)
+            if self.duration > 0:
+                trim_group = Adw.PreferencesGroup(title="Trim")
+                trim_group.add(box)
+                page.add(trim_group)
+            self.set_trim()
+
             group = Adw.PreferencesGroup()
             page.add(group)
-            self.only_mix = Adw.SwitchRow(title="Only mix audio", subtitle="Keep the original video quality")
+            self.only_mix = Adw.SwitchRow(title="Keep original quality",
+                                          subtitle="No re-encode: only trim and mix audio")
             self.only_mix.connect("notify::active", self.update)
-            if len(titles) > 1:
-                group.add(self.only_mix)
+            group.add(self.only_mix)
             self.size = Adw.SpinRow.new_with_range(1, 500, 1)
             self.size.set_title("Target size")
             self.size.set_subtitle("MB")
@@ -229,13 +267,75 @@ def main():
             box.append(button)
             return box
 
+        PAD = 8  # timeline side margin, room for the handles
+
+        def t_to_x(self, t, w):
+            return self.PAD + t / self.duration * (w - 2 * self.PAD)
+
+        def x_to_t(self, x, w):
+            return min(max((x - self.PAD) / (w - 2 * self.PAD), 0), 1) * self.duration
+
+        def playhead(self):
+            return self.media.get_timestamp() / 1e6
+
+        def draw_timeline(self, area, cr, w, h):
+            fg = area.get_color()
+            x0, x1 = self.t_to_x(self.start_t, w), self.t_to_x(self.end_t, w)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.15)  # cut away
+            cr.rectangle(self.PAD, 6, w - 2 * self.PAD, h - 12)
+            cr.fill()
+            sm = Adw.StyleManager.get_default()  # accent colour API is libadwaita 1.6+
+            acc = sm.get_accent_color_rgba() if hasattr(sm, "get_accent_color_rgba") else Gdk.RGBA(red=0.21, green=0.52, blue=0.89)
+            cr.set_source_rgb(acc.red, acc.green, acc.blue)  # kept
+            cr.rectangle(x0, 6, x1 - x0, h - 12)
+            cr.fill()
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 1)  # handles
+            for x in (x0, x1):
+                cr.rectangle(x - 3, 0, 6, h)
+            cr.fill()
+            cr.set_source_rgb(0.88, 0.11, 0.14)  # playhead
+            cr.rectangle(self.t_to_x(self.playhead(), w) - 1, 2, 2, h - 4)
+            cr.fill()
+
+        def drag_begin(self, g, x, y):
+            w = self.timeline.get_width()
+            d0, d1 = abs(x - self.t_to_x(self.start_t, w)), abs(x - self.t_to_x(self.end_t, w))
+            self.drag = None if min(d0, d1) > 12 else "start" if d0 <= d1 else "end"
+            self.drag_update(g, 0, 0)
+
+        def drag_update(self, g, dx, dy):
+            _, x, _ = g.get_start_point()
+            t = self.x_to_t(x + dx, self.timeline.get_width())
+            if self.drag == "start":
+                self.set_trim(start=t)
+            elif self.drag == "end":
+                self.set_trim(end=t)
+            else:  # click or drag off the handles moves the playhead
+                self.media.seek(int(t * 1e6))
+
+        def set_trim(self, start=None, end=None):
+            """Move a handle (clamped, keeps 0.1 s between them) and show that frame."""
+            if start is not None:
+                self.start_t = min(max(start, 0), self.end_t - 0.1)
+                self.media.seek(int(self.start_t * 1e6))
+            if end is not None:
+                self.end_t = max(min(end, self.duration), self.start_t + 0.1)
+                self.media.seek(int(self.end_t * 1e6))
+            self.trim_label.set_label(f"{clock(self.start_t)} – {clock(self.end_t)}"
+                                      f"  ({self.end_t - self.start_t:.1f} s)")
+            self.timeline.queue_draw()
+
+        def trim(self):
+            return (round(self.start_t, 3), round(self.end_t, 3)) \
+                if self.start_t > 0 or self.end_t < self.duration else None
+
         def selected(self):
             return [i for i, cb in enumerate(self.checks) if cb.get_active()] or [0]
 
         def update(self, *_):
             mix = self.only_mix.get_active()
             self.size.set_sensitive(not mix)
-            self.go.set_label("Mix Audio" if mix else "Compress")
+            self.go.set_label("Save" if mix else "Compress")
             self.go.set_sensitive(not self.checks or any(cb.get_active() for cb in self.checks))
 
         def pick_folder(self, *_):
@@ -252,20 +352,21 @@ def main():
         def start(self, *_):
             mb = int(self.size.get_value())
             self.tmp = tempfile.mkdtemp(prefix="video-tweaks.")
-            pick = self.noise.get_selected()
+            pick, trim = self.noise.get_selected(), self.trim()
+            self.media.pause()
             self.out, steps = plan(self.path, self.track_count, self.selected(),
                                    self.only_mix.get_active(), mb, self.out_dir, self.tmp,
-                                   pick - 1 if pick > 0 else None)
+                                   pick - 1 if pick > 0 else None, trim)
             self.log.get_buffer().set_text("")
             self.bar.set_fraction(0)
-            self.status.set_label(f"Mixing audio of {Path(self.path).name}…" if self.only_mix.get_active()
+            self.status.set_label(f"Saving {Path(self.out).name}…" if self.only_mix.get_active()
                                   else f"Compressing {Path(self.path).name} to {mb} MB…")
             self.cancel_btn.set_visible(True)
             self.back_btn.set_visible(False)
             self.show_btn.set_visible(False)
             self.stack.set_visible_child_name("progress")
             env = dict(os.environ, TMPDIR=self.tmp)
-            self.job = Job(steps, self.duration, env,
+            self.job = Job(steps, trim[1] - trim[0] if trim else self.duration, env,
                            lambda l: GLib.idle_add(self.add_line, l),
                            lambda f: GLib.idle_add(self.bar.set_fraction, f))
             threading.Thread(target=self.work, daemon=True).start()

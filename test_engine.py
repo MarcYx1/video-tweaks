@@ -82,6 +82,20 @@ with tempfile.TemporaryDirectory() as d:
     assert os.path.getsize(out) <= 1_100_000, os.path.getsize(out)
     assert prog == sorted(prog) and len(prog) > 5 and prog[-1] == 1.0, prog
 
+    # trim, keep original: video copied, so it may start at the keyframe before 2 s
+    out, steps = vt.plan(src, 4, [1], True, 8, d, d, trim=(2, 6))
+    assert out.endswith("clip one_trimmed.mp4")
+    rc, _ = run(steps, 4, d)
+    assert rc == 0 and streams(out) == ["video", "audio"]
+    assert 3.9 < vt.probe(out)[0] < 6.1, vt.probe(out)[0]
+    # trim + mix + compress: exact length
+    tmp = tempfile.mkdtemp(dir=d)
+    out, steps = vt.plan(src, 4, [0, 1], False, 1, d, tmp, trim=(2, 6))
+    rc, prog = run(steps, 4, tmp)
+    assert rc == 0 and streams(out) == ["video", "audio"]
+    assert abs(vt.probe(out)[0] - 4) < 0.15, vt.probe(out)[0]
+    assert prog[-1] == 1.0
+
     # cancel mid-encode: no ffmpeg left, pass logs only in the job's TMPDIR
     tmp = tempfile.mkdtemp(dir=d)
     out, steps = vt.plan(src, 4, [0, 1], False, 2, d, tmp)
