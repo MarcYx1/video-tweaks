@@ -88,6 +88,17 @@ with tempfile.TemporaryDirectory() as d:
     rc, _ = run(steps, 4, d)
     assert rc == 0 and streams(out) == ["video", "audio"]
     assert 3.9 < vt.probe(out)[0] < 6.1, vt.probe(out)[0]
+    first = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+                            "-of", "csv=p=0", out], capture_output=True, text=True).stdout.split()[0]
+    assert float(first) >= 0, f"hidden lead-in frames (VLC freezes): first pts {first}"
+    # volume: forces the filter path, and plays
+    out, steps = vt.plan(src, 4, [0, 1], True, 8, d, d, volumes={1: 0.5})
+    assert "volume=0.5" in " ".join(steps[0][1])
+    rc, _ = run(steps, dur, d)
+    assert rc == 0 and streams(out) == ["video", "audio"]
+    assert vt.find_mic(["Chat", "Game", "Media", "Mic"]) == 3
+    assert vt.find_mic(["Devices: Monitor of Speakers", "Devices: alsa_input.usb-mic"]) == 1
+    assert vt.find_mic(["Game"]) is None
     # trim + mix + compress: exact length
     tmp = tempfile.mkdtemp(dir=d)
     out, steps = vt.plan(src, 4, [0, 1], False, 1, d, tmp, trim=(2, 6))

@@ -31,19 +31,42 @@ def probe(path):
     return float(d["format"].get("duration") or 0), titles
 
 
-def mix_cmd(src, tracks, dst, denoise=None, trim=None):
+def find_mic(titles):
+    """Index of the first track that looks like a microphone, or None."""
+    return next((i for i, t in enumerate(titles)
+                 if re.search(r"mic|input", t, re.I) and "Monitor of" not in t), None)
+
+
+def keyframe_before(src, t):
+    """Time of the last video keyframe at or before t. A copy cut that starts exactly there has
+    no hidden lead-in frames; VLC freezes and smears on those."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags",
+         "-read_intervals", f"{max(t - 30, 0)}%{t + 0.001}", "-of", "csv=p=0", src],
+        capture_output=True, text=True, check=True).stdout
+    keys = [float(p) for p, f, *_ in (l.split(",") for l in out.split())
+            if "K" in f and p != "N/A" and float(p) <= t + 0.001]
+    return max(keys, default=t)
+
+
+def mix_cmd(src, tracks, dst, denoise=None, trim=None, volumes=None):
     """Mix the chosen audio tracks into one; track `denoise` (if any) goes through RNNoise first.
-    trim=(start, end) in s: video is copied, so the cut starts at the keyframe before `start`."""
-    if len(tracks) == 1 and denoise is None:
-        audio = ["-map", f"0:a:{tracks[0]}", "-c:a", "copy"]
-    else:
+    volumes={track: factor}. trim=(start, end) in s; video is copied, so start should be a keyframe."""
+    vol = volumes or {}
+
+    def chain(i):
         # ponytail: model path is single-quoted, breaks if it contains a ' (install path never does)
         # aeval: arnndn leaves garbage (NaN or huge values) in the last partial frame at end of stream,
         # which makes aac fail; zero anything that is NaN or beyond +-2 (real audio stays within +-1)
-        pre = "".join(f"[0:a:{i}]highpass=f=80,arnndn=m='{MODEL}',"
-                      f"aeval=exprs='if(isnan(val(ch))+gt(abs(val(ch)),2),0,val(ch))':c=same[d{i}];"
-                      for i in tracks if i == denoise)
-        ins = "".join(f"[d{i}]" if i == denoise else f"[0:a:{i}]" for i in tracks)
+        f = [f"highpass=f=80,arnndn=m='{MODEL}',"
+             "aeval=exprs='if(isnan(val(ch))+gt(abs(val(ch)),2),0,val(ch))':c=same"] if i == denoise else []
+        return ",".join(f + ([f"volume={vol[i]}"] if vol.get(i, 1) != 1 else []))
+
+    if len(tracks) == 1 and not chain(tracks[0]):
+        audio = ["-map", f"0:a:{tracks[0]}", "-c:a", "copy"]
+    else:
+        pre = "".join(f"[0:a:{i}]{chain(i)}[d{i}];" for i in tracks if chain(i))
+        ins = "".join(f"[d{i}]" if chain(i) else f"[0:a:{i}]" for i in tracks)
         graph = pre + ins + f"amix=inputs={len(tracks)}:normalize=0[a]"
         audio = ["-filter_complex", graph, "-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
     cut = ["-ss", str(trim[0]), "-to", str(trim[1])] if trim else []
@@ -51,18 +74,20 @@ def mix_cmd(src, tracks, dst, denoise=None, trim=None):
             "-c:v", "copy", "-movflags", "+faststart", dst]
 
 
-def plan(src, track_count, tracks, only_mix, mb, out_dir, tmp, denoise=None, trim=None):
+def plan(src, track_count, tracks, only_mix, mb, out_dir, tmp, denoise=None, trim=None, volumes=None):
     """Return (output path, steps). A step is (weight, argv, is_dcomp). trim=(start, end) in s or None."""
     stem = Path(src).stem
-    mixing = len(tracks) > 1 or denoise is not None
+    mixing = len(tracks) > 1 or denoise is not None or bool(volumes)
     tag = ("trimmed" if trim and not mixing else "mixed") if only_mix else f"{mb}mb"
     out = str(Path(out_dir) / f"{stem}_{tag}.mp4")
     if only_mix:
-        return out, [(1.0, mix_cmd(src, tracks, out, denoise, trim), False)]
+        if trim:
+            trim = (keyframe_before(src, trim[0]), trim[1])
+        return out, [(1.0, mix_cmd(src, tracks, out, denoise, trim, volumes), False)]
     cut = [str(trim[0]), str(trim[1])] if trim else []  # dcomp cuts exact, the mix step does not cut
-    if track_count > 1 or denoise is not None:  # dcomp keeps one audio track as is: mix/filter first
+    if track_count > 1 or mixing:  # dcomp keeps one audio track as is: mix/filter first
         mixed = os.path.join(tmp, "mixed.mp4")
-        return out, [(0.1, mix_cmd(src, tracks, mixed, denoise), False),
+        return out, [(0.1, mix_cmd(src, tracks, mixed, denoise, volumes=volumes), False),
                      (0.9, [str(DCOMP), mixed, str(mb), out, *cut], True)]
     return out, [(1.0, [str(DCOMP), src, str(mb), out, *cut], True)]
 
@@ -203,7 +228,11 @@ def main():
             self.folder_row.set_activatable_widget(pick)
             group.add(self.folder_row)
 
-            self.checks = []
+            self.checks, self.vols = [], []
+            css = Gtk.CssProvider()  # fixed-width % label, else the slider jumps as the number changes
+            css.load_from_string("scale.vol value { min-width: 3.5em; }")
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             self.noise = Adw.ComboRow(title="Filter mic noise", subtitle="Removes breathing and background noise",
                                       model=Gtk.StringList.new(["Off", *(track_name(t, i) for i, t in enumerate(titles))]))
             if titles:
@@ -218,10 +247,25 @@ def main():
                     cb.connect("toggled", self.update)
                     row.add_prefix(cb)
                     row.set_activatable_widget(cb)
+                    vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 200, 5)
+                    vol.set_value(100)
+                    vol.add_mark(100, Gtk.PositionType.BOTTOM, None)
+                    vol.set_format_value_func(lambda _s, v: f"{v:.0f}%")
+                    vol.set_draw_value(True)
+                    vol.set_value_pos(Gtk.PositionType.RIGHT)
+                    vol.set_size_request(170, -1)
+                    vol.set_valign(Gtk.Align.CENTER)
+                    vol.set_tooltip_text("Volume")
+                    vol.add_css_class("vol")
+                    row.add_suffix(vol)
                     tg.add(row)
                     self.checks.append(cb)
+                    self.vols.append(vol)
             if titles and MODEL:
                 tg.add(self.noise)
+                mic = find_mic(titles)
+                if mic is not None:
+                    self.noise.set_selected(mic + 1)
             self.track_count = len(titles)
 
             self.go = Gtk.Button(halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
@@ -329,6 +373,9 @@ def main():
             return (round(self.start_t, 3), round(self.end_t, 3)) \
                 if self.start_t > 0 or self.end_t < self.duration else None
 
+        def volumes(self):
+            return {i: round(v.get_value() / 100, 2) for i, v in enumerate(self.vols) if v.get_value() != 100}
+
         def selected(self):
             return [i for i, cb in enumerate(self.checks) if cb.get_active()] or [0]
 
@@ -356,7 +403,7 @@ def main():
             self.media.pause()
             self.out, steps = plan(self.path, self.track_count, self.selected(),
                                    self.only_mix.get_active(), mb, self.out_dir, self.tmp,
-                                   pick - 1 if pick > 0 else None, trim)
+                                   pick - 1 if pick > 0 else None, trim, self.volumes())
             self.log.get_buffer().set_text("")
             self.bar.set_fraction(0)
             self.status.set_label(f"Saving {Path(self.out).name}…" if self.only_mix.get_active()

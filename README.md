@@ -4,9 +4,9 @@ Right-click a video in GNOME Files and pick **Video Tweaks** to:
 
 - **Trim** it: the window plays the video and shows a timeline under it. Drag the start and end handles (the video shows the frame you are on), or play to a point and press **Set start** / **Set end**. Click elsewhere on the timeline to move the playhead.
 - **Compress** it to a target size (default 8 MB), for example to fit Discord's upload limit.
-- **Mix audio tracks** into one. Screen recorders such as GPU Screen Recorder or OBS can save game, chat, media and mic on separate tracks. Discord and most players only play the first track, so the rest is silent. Pick the tracks you want and they get mixed into one.
-- **Keep original quality**: trim and/or mix without re-encoding the video. The cut then starts at the keyframe before your start point; players that honour MP4 edit lists still start at the exact frame. Compressing always cuts frame-exact.
-- **Filter mic noise**: pick one track (your mic) and run it through [RNNoise](https://jmvalin.ca/demo/rnnoise/) to cut breathing, fans and keyboard noise while keeping your voice.
+- **Mix audio tracks** into one. Screen recorders such as GPU Screen Recorder or OBS can save game, chat, media and mic on separate tracks. Discord and most players only play the first track, so the rest is silent. Pick the tracks you want and they get mixed into one. Each track has a volume slider (0-200 %).
+- **Keep original quality**: trim and/or mix without re-encoding the video. The cut then starts at the keyframe at or before your start point (up to one keyframe interval early, 2 s for GPU Screen Recorder). Compressing always cuts frame-exact.
+- **Filter mic noise**: pick one track (your mic) and run it through [RNNoise](https://jmvalin.ca/demo/rnnoise/) to cut breathing, fans and keyboard noise while keeping your voice. It is on by default for the first track whose name contains "mic" or "input" (for example GPU Screen Recorder's `Mic` track).
 
 ![Video Tweaks window](docs/screenshot.png)
 
